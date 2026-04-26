@@ -1,0 +1,191 @@
+# .github/workflows/deploy-agent.yml
+#
+# v5: Region-aware deploy. Triggered by the marketplace via workflow_dispatch
+# with target_region input. Resolves resource group and env from that.
+#
+# Required GitHub repo SECRETS:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#
+# Required GitHub repo VARIABLES:
+#   ACR_LOGIN_SERVER                 (shared UAE registry)
+#   CONTAINER_ENV_ID                 (UAE env)
+#   PLATFORM_IDENTITY_ID             (UAE identity)
+#   PLATFORM_KEYVAULT_URI            (UAE KV uri)
+#   CONTAINER_ENV_ID_UKSOUTH         (UK env)
+#   PLATFORM_IDENTITY_ID_UKSOUTH     (UK identity)
+#   PLATFORM_KEYVAULT_URI_UKSOUTH    (UK KV uri)
+
+name: RFP Agent — Build & Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target_region:
+        description: 'Azure region (uaenorth | uksouth)'
+        required: false
+        default: 'uaenorth'
+      tenant_slug:
+        description: 'Tenant slug (lowercase, alphanumeric + hyphens)'
+        required: false
+        default: ''
+      deployment_id:
+        description: 'Marketplace deployment ID (for callback)'
+        required: false
+      platform_webhook:
+        description: 'Marketplace webhook URL'
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AGENT_ID: rfp-agent
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  resolve-target:
+    runs-on: ubuntu-latest
+    outputs:
+      region:        ${{ steps.resolve.outputs.region }}
+      resource_group: ${{ steps.resolve.outputs.resource_group }}
+      env_id:        ${{ steps.resolve.outputs.env_id }}
+      identity_id:   ${{ steps.resolve.outputs.identity_id }}
+      kv_uri:        ${{ steps.resolve.outputs.kv_uri }}
+      container_app: ${{ steps.resolve.outputs.container_app }}
+    steps:
+      - name: Resolve target region
+        id: resolve
+        run: |
+          REGION="${{ inputs.target_region || 'uaenorth' }}"
+          SLUG="${{ inputs.tenant_slug }}"
+
+          # Container app name: rfp-agent or rfp-agent-<slug>
+          if [ -n "$SLUG" ]; then
+            APP_NAME="${{ env.AGENT_ID }}-${SLUG}"
+          else
+            APP_NAME="${{ env.AGENT_ID }}"
+          fi
+
+          echo "region=$REGION"             >> "$GITHUB_OUTPUT"
+          echo "container_app=$APP_NAME"    >> "$GITHUB_OUTPUT"
+
+          if [ "$REGION" = "uksouth" ]; then
+            echo "resource_group=ai-platform-rg-uksouth"                     >> "$GITHUB_OUTPUT"
+            echo "env_id=${{ vars.CONTAINER_ENV_ID_UKSOUTH }}"               >> "$GITHUB_OUTPUT"
+            echo "identity_id=${{ vars.PLATFORM_IDENTITY_ID_UKSOUTH }}"      >> "$GITHUB_OUTPUT"
+            echo "kv_uri=${{ vars.PLATFORM_KEYVAULT_URI_UKSOUTH }}"          >> "$GITHUB_OUTPUT"
+          else
+            echo "resource_group=ai-platform-rg"                             >> "$GITHUB_OUTPUT"
+            echo "env_id=${{ vars.CONTAINER_ENV_ID }}"                       >> "$GITHUB_OUTPUT"
+            echo "identity_id=${{ vars.PLATFORM_IDENTITY_ID }}"              >> "$GITHUB_OUTPUT"
+            echo "kv_uri=${{ vars.PLATFORM_KEYVAULT_URI }}"                  >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::notice::Deploying to $APP_NAME in $REGION"
+
+  build:
+    needs: resolve-target
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in shared ACR
+        id: meta
+        run: |
+          ACR_NAME="$(echo '${{ vars.ACR_LOGIN_SERVER }}' | cut -d. -f1)"
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/${{ env.AGENT_ID }}:${{ env.IMAGE_TAG }}"
+
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "${{ env.AGENT_ID }}:${{ env.IMAGE_TAG }}" \
+            --image "${{ env.AGENT_ID }}:latest" \
+            .
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [resolve-target, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update or create Container App
+        run: |
+          set -e
+          APP="${{ needs.resolve-target.outputs.container_app }}"
+          RG="${{ needs.resolve-target.outputs.resource_group }}"
+          IMAGE="${{ needs.build.outputs.image }}"
+
+          if az containerapp show --name "$APP" --resource-group "$RG" >/dev/null 2>&1; then
+            echo "→ Container App exists — updating image"
+            az containerapp update --no-wait \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --image "$IMAGE"
+          else
+            echo "→ Creating new Container App"
+            az containerapp create --no-wait \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --environment "${{ needs.resolve-target.outputs.env_id }}" \
+              --image "$IMAGE" \
+              --target-port 3010 \
+              --ingress external \
+              --transport auto \
+              --min-replicas 1 \
+              --max-replicas 5 \
+              --cpu 0.5 \
+              --memory 1.0Gi \
+              --user-assigned "${{ needs.resolve-target.outputs.identity_id }}" \
+              --registry-server "${{ vars.ACR_LOGIN_SERVER }}" \
+              --registry-identity "${{ needs.resolve-target.outputs.identity_id }}" \
+              --env-vars \
+                AGENT_ID="${{ env.AGENT_ID }}" \
+                NODE_ENV=production \
+                PORT=3010 \
+                TENANT_SLUG="${{ inputs.tenant_slug }}" \
+                TARGET_REGION="${{ needs.resolve-target.outputs.region }}" \
+                PLATFORM_KEYVAULT_URI="${{ needs.resolve-target.outputs.kv_uri }}"
+          fi
+
+      - name: Wait for revision to become healthy
+        run: |
+          set -e
+          APP="${{ needs.resolve-target.outputs.container_app }}"
+          RG="${{ needs.resolve-target.outputs.resource_group }}"
+
+          for i in $(seq 1 40); do
+            STATE=$(az containerapp show --name "$APP" --resource-group "$RG" \
+              --query "properties.runningStatus" -o tsv 2>/dev/null || echo "Unknown")
+            HEALTH=$(az containerapp revision list --name "$APP" --resource-group "$RG" \
+              --query "[?properties.active].properties.healthState | [0]" -o tsv 2>/dev/null || echo "")
+            echo "  poll $i: running=$STATE health=$HEALTH"
+            if [ "$STATE" = "Running" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo "✓ Container App healthy"
+              break
+            fi
+            sleep 6
+          done
+
+      - name: Report URL
+        run: |
+          APP="${{ needs.resolve-target.outputs.container_app }}"
+          RG="${{ needs.resolve-target.outputs.resource_group }}"
+          FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "::notice::$APP live at https://$FQDN"
