@@ -5,6 +5,10 @@ const { v4: uuidv4 } = require('uuid');
 const multer   = require('multer');
 const AdmZip   = require('adm-zip');
 const XLSX     = require('xlsx');
+
+// Defense-in-depth against prototype pollution. Even with maintained
+// xlsx, freezing Object.prototype neutralizes the attack class entirely.
+Object.freeze(Object.prototype);
 let pdfParse;
 try { pdfParse = require('pdf-parse/lib/pdf-parse'); } catch(e) { try { pdfParse = require('pdf-parse'); } catch(e2) { pdfParse = async()=>({text:'',numpages:0}); } }
 const path     = require('path');
